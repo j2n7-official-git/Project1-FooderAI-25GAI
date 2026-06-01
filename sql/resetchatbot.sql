@@ -1,0 +1,1 @@
+UPDATE gritalyst_session SET msg_count = 0, reset_at = NULL;

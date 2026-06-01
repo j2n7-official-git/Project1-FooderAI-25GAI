@@ -1,6 +1,12 @@
 import sys
 import os
 
+# HÀM CẤP CỨU - DÙNG CHUNG TOÀN APP
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
 # --- PHẦN GIẢI THÍCH CHI TIẾT CÁC LINH KIỆN (BỘ PHẬN MÁY) ---
 """
 1. PySide6.QtWidgets (Bộ khung xương và Nội thất):
@@ -37,6 +43,7 @@ from pages.page_scan import PageFoodScanner
 from pages.page_almanac import PageFoodAlmanac
 from pages.page_gym import PageExercise
 from pages.page_user import PageUserProfile
+from pages.page_version_info import InfoButton, PageVersionInfo
 
 
 # --- MẠCH NẠP PHÔNG CHỮ QUỐC TẾ HÓA (BẢN ĐỦ) ---
@@ -44,7 +51,7 @@ def load_fonts():
      """
      HÀM NẠP PHÔNG CHỮ: Đăng ký các file .ttf vào hệ thống để app hiển thị đúng font Roboto[cite: 1352].
      """
-     font_dir = os.path.join("assets", "fooderai-fonts")
+     font_dir = resource_path(os.path.join("assets", "fooderai-fonts"))
      font_files = ["Roboto-Regular.ttf", "Roboto-Medium.ttf", "Roboto-Bold.ttf",
                    "Roboto-Light.ttf", "Roboto_SemiCondensed-Light.ttf",
                    "Roboto_SemiCondensed-Medium.ttf", "Roboto_SemiCondensed-Regular.ttf",
@@ -61,8 +68,6 @@ def load_fonts():
 """
 PHÂN XƯỞNG 1: LỚP CUSTOMBUTTON (Nút bấm thông minh)
 """
-
-
 class CustomButton(QPushButton):
      def __init__(self, normal_img, hover_img, parent=None):
           super().__init__(parent)
@@ -100,7 +105,18 @@ class FooderAI(QMainWindow):
           # --- CẤU HÌNH KHUNG XƯƠNG CỬA SỔ ---
           self.setWindowFlags(Qt.WindowType.FramelessWindowHint)  # Xóa khung Windows mặc định [cite: 991]
           self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # Cho phép bo góc trong suốt [cite: 1007]
-          self.setFixedSize(1600, 1025)  # Chiều cao 985px theo đúng yêu cầu
+          """
+          [BUG — fooderMain.py] DPI SCALING MISMATCH — Feedback: Nguyên Việt Anh (25AI002)
+          Máy Tài (25AI045) chạy Windows Display Scale 125%/150% → setFixedSize(1600, 1025)
+          bị nhân vật lý lên 1.25x = 2000px → cửa sổ tràn màn hình, mất thanh input + nút gửi.
+          FIX (260527): Dùng availableGeometry() để đọc kích thước màn hình THỰC TẾ sau khi
+          Qt đã áp dụng DPI scale, rồi min() giới hạn tối đa 1600×1025 — máy to vẫn đủ,
+          máy nhỏ/scale cao tự co lại vừa vặn, không bao giờ tràn ra ngoài màn hình nữa.
+          """
+          screen = QApplication.primaryScreen().availableGeometry()
+          win_w  = min(1600, screen.width())
+          win_h  = min(1025, screen.height())
+          self.setFixedSize(win_w, win_h)
 
           self.central_widget = QWidget(self)
           self.setCentralWidget(self.central_widget)
@@ -108,7 +124,7 @@ class FooderAI(QMainWindow):
           # --- BỘ PHẬN 1: THANH ACTIVE BAR (VÔ LĂNG) ---
           self.active_bar = QLabel(self.central_widget)
           self.active_bar.setGeometry(0, 0, 1600, 58)  # Nằm ở tọa độ y=0, cao 58px [cite: 1744]
-          path_bar = os.path.join("assets", "fooderai-bar", "fooder_ai_win_activebar.png")
+          path_bar = resource_path(os.path.join("assets", "fooderai-bar", "fooder_ai_win_activebar.png")) #<=UPDATE
           self.active_bar.setPixmap(QPixmap(path_bar).scaled(1600, 58, Qt.AspectRatioMode.IgnoreAspectRatio,
                                                              Qt.TransformationMode.SmoothTransformation))
 
@@ -154,7 +170,7 @@ class FooderAI(QMainWindow):
           """
           self.canvas = QLabel(self.central_widget)
           self.canvas.setGeometry(0, 57, 1600, 960)
-          path_bg = os.path.join("assets", "fooderai-background", "fooderaibg", "fooder_bg.PNG")
+          path_bg  = resource_path(os.path.join("assets", "fooderai-background", "fooderaibg", "fooder_bg.PNG")) #<= UPDATE
           if os.path.exists(path_bg):
                self.canvas.setPixmap(QPixmap(path_bg).scaled(1600, 960, Qt.AspectRatioMode.IgnoreAspectRatio,
                                                              Qt.TransformationMode.SmoothTransformation))
@@ -164,7 +180,7 @@ class FooderAI(QMainWindow):
           self.active_bar.raise_()
 
           # --- BỘ PHẬN 5: HỆ THỐNG NÚT BẤM (MARGIN 30 DỌC) ---
-          btn_path = os.path.join("assets", "fooderai-interact-button")
+          btn_path = resource_path(os.path.join("assets", "fooderai-interact-button")) #<=UPDATE
 
           self.btn_close = CustomButton(
                os.path.join(btn_path, "fooder_ai_closebutton.png"),
@@ -210,6 +226,24 @@ class FooderAI(QMainWindow):
           self.feature_stack.addWidget(self.page_gym)  # Index 3
           self.feature_stack.addWidget(self.page_user)  # Index 4
 
+          # ── [MỚI] Trang Version Info ──────────────────────────────
+          self.page_version_info = PageVersionInfo()
+          self.feature_stack.addWidget(self.page_version_info)  # Index 5
+
+          # ── [MỚI] Nút ⓘ — bên phải ModeNavBar ───────────────────
+          self.btn_info = InfoButton(self.central_widget)
+          self.btn_info.move(1432, 295) #chỉnh sửa tọa độ tại đây
+          self.btn_info.raise_()
+
+          self.connect_nav_buttons()  # ← dòng này giữ nguyên
+
+          self.btn_info.clicked.connect(
+               lambda: self.feature_stack.setCurrentIndex(5)
+          )
+
+          self.feature_stack.show()
+
+
           self.connect_nav_buttons()
           self.feature_stack.show()
 
@@ -238,7 +272,24 @@ class FooderAI(QMainWindow):
 
 
 if __name__ == "__main__":
+     """
+     [BUG — fooderMain.py] HIGH DPI AWARENESS MISSING — Feedback: Nguyên Việt Anh (25AI002)
+     Thiếu khai báo DPI policy trước khi tạo QApplication khiến Qt dùng chế độ scale mặc định
+     → trên máy Tài (Windows 125%) toàn bộ widget bị phóng to vật lý, tràn ra ngoài viewport.
+     FIX (260527): Set 2 env var TRƯỚC khi QApplication() khởi tạo — Qt đọc biến này ở giai
+     đoạn boot, nếu set sau thì không có hiệu lực. PassThrough = giữ nguyên tỉ lệ thực, không
+     làm tròn lên/xuống → widget render đúng pixel trên mọi mức scale (100%, 125%, 150%, 200%).
+     """
+     os.environ["QT_ENABLE_HIGHDPI_SCALING"]       = "1"
+     os.environ["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+
      app = QApplication(sys.argv)
+     app.setHighDpiScaleFactorRoundingPolicy(
+          Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+          # PassThrough: Qt KHÔNG làm tròn hệ số scale (ví dụ: 1.25 giữ nguyên 1.25)
+          # Nếu dùng Round (mặc định): 1.25 → 1.0 hoặc 2.0 → layout sai lệch hoàn toàn
+     )
+
      window = FooderAI()
      window.show()
      sys.exit(app.exec())

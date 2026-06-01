@@ -23,7 +23,9 @@ Cách dùng: thay os.path.join("assets", ...) bằng resource_path(os.path.join(
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    # [FIX] Dùng __file__ thay abspath(".") → luôn trỏ đúng thư mục chứa file .py
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative_path)
 
 # =====================================================================
 # LỚP 1: STATCARD (CHỈ CHỨA LOGIC CỦA 4 CÁI HỘP BMI, BMR...)
