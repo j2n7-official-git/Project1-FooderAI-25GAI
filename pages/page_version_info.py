@@ -324,8 +324,8 @@ class PageVersionInfo(QFrame):
 
     Bố cục (KHÔNG có banner trên đầu):
         ┌──────────┬───────────────────────────────────────────────┐
-        │  Logo    │  THÔNG TIN PHẦN MỀM (Bold 26px)              │
-        │  160px   │  Đồ án cơ sở 1 – FooderAI (20px)             │
+        │  Logo    │  THÔNG TIN PHẦN MỀM (Bold 26px)               │
+        │  160px   │  Đồ án cơ sở 1 – FooderAI (20px)              │
         │          │  Phiên bản ...                                │
         │  Fooder  │  ───────────────────────────────              │
         │   AI     │  [mô tả]                                      │
@@ -491,7 +491,7 @@ class PageVersionInfo(QFrame):
         self.lbl_title.setStyleSheet(f"color: {self.C_TEXT};")
 
         # ── Phiên bản ─────────────────────────────────────────────────
-        self.lbl_version = QLabel("Phiên bản v1.01_1600s.dev260529_lab25gai")
+        self.lbl_version = QLabel("Phiên bản v1.05_5510sf.final260601_lab25gai")
         ver_font = QFont("Roboto")
         ver_font.setPixelSize(20)
         self.lbl_version.setFont(ver_font)
@@ -603,7 +603,7 @@ class PageVersionInfo(QFrame):
 
     def set_content(
         self,
-        version: str = "v1.01_1600s.dev260529_lab25gai",
+        version: str = "v1.05_5510sf.final260601_lab25gai",
         description: str = (
             "FooderAI là trợ lý dinh dưỡng thông minh hỗ trợ tư vấn chế độ ăn uống, "
             "tính toán chỉ số sức khỏe (BMI, BMR, TDEE), nhận diện món ăn qua hình ảnh "

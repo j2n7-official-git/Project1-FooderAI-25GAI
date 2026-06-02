@@ -86,34 +86,48 @@ def get_connection() -> pyodbc.Connection:
 # NHÓM HÀM: USERS
 # ============================================================
 
-def upsert_user(uid: str, email: str, display_name: str = None) -> int:
+def upsert_user(uid, display_name, email, photo_url=None, google_access_token=None):
     """
-    Tạo mới user hoặc cập nhật nếu đã tồn tại (theo uid Firebase).
-    Trả về user_id nội bộ trong DB.
+    Đồng bộ user từ Google/Local vào SQL Server dựa trên cột 'uid' (chuỗi).
+    Trả về 'user_id' (số nguyên) để dùng cho các bảng khác.
+    """
+    try:
+        conn = get_connection()  # Đã sửa đúng tên hàm kết nối
+        cursor = conn.cursor()
 
-    [UPDATE v1] Dùng MERGE để tránh lỗi duplicate key khi login lại nhiều lần
-    """
-    sql = """
-    MERGE users AS target
-    USING (SELECT ? AS uid, ? AS email, ? AS display_name) AS source
-    ON target.uid = source.uid
-    WHEN MATCHED THEN
-        UPDATE SET
-            email        = source.email,
-            display_name = source.display_name,
-            updated_at   = GETDATE()
-    WHEN NOT MATCHED THEN
-        INSERT (uid, email, display_name)
-        VALUES (source.uid, source.email, source.display_name);
-    """
-    with get_connection() as conn:
-        conn.execute(sql, (uid, email, display_name))
+        # 1. Tìm xem uid (mã Google/Local) đã tồn tại chưa
+        cursor.execute("SELECT user_id FROM dbo.users WHERE uid = ?", (uid,))
+        row = cursor.fetchone()
+
+        now = datetime.now()
+
+        if not row:
+            # 2. Nếu chưa có -> THÊM MỚI (Lưu ý: KHÔNG insert vào user_id vì nó tự tăng)
+            # Dùng OUTPUT INSERTED.user_id để chộp ngay cái số nguyên vừa được tạo ra
+            sql = """
+                INSERT INTO dbo.users (uid, display_name, email, provider, photo_url, google_access_token, created_at, last_login_at)
+                OUTPUT INSERTED.user_id
+                VALUES (?, ?, ?, 'google', ?, ?, ?, ?)
+            """
+            cursor.execute(sql, (uid, display_name, email, photo_url, google_access_token, now, now))
+            internal_user_id = cursor.fetchone()[0]
+            print(f"[DB] Thêm mới thành viên thành công: {display_name}")
+        else:
+            # 3. Nếu có rồi -> CẬP NHẬT
+            internal_user_id = row[0]
+            sql = """
+                UPDATE dbo.users 
+                SET display_name = ?, email = ?, photo_url = ?, google_access_token = ?, last_login_at = ?
+                WHERE uid = ?
+            """
+            cursor.execute(sql, (display_name, email, photo_url, google_access_token, now, uid))
+            print(f"[DB] Cập nhật phiên đăng nhập thành công: {display_name}")
+
         conn.commit()
-        # Lấy user_id vừa tạo/cập nhật
-        row = conn.execute(
-            "SELECT user_id FROM users WHERE uid = ?", uid
-        ).fetchone()
-        return row[0] if row else None
+        return internal_user_id  # Bắt buộc trả về SỐ NGUYÊN
+    except Exception as e:
+        print(f"❌ [DB] Lỗi hàm upsert_user: {e}")
+        return None
 
 
 def update_user_profile(user_id: int, age: int, gender: str,
@@ -237,21 +251,27 @@ def save_session_state(session_id: int, msg_count: int, nsfw_streak: int,
     """
     Lưu trạng thái NSFWGuard xuống DB sau mỗi lần gửi tin.
     Gọi trong record_clean() và record_nsfw() của NSFWGuard.
-
-    [UPDATE v1] Đây là chỗ làm cho đồng hồ đếm "tính thật":
-    muted_until và reset_at được lưu vào DB → tắt app vẫn còn hiệu lực
     """
     with get_connection() as conn:
-        conn.execute("""
-            UPDATE gritalyst_session SET
-                msg_count   = ?,
-                nsfw_streak = ?,
-                muted_until = ?,
-                reset_at    = ?,
-                updated_at  = GETDATE()
-            WHERE session_id = ?
-        """, (msg_count, nsfw_streak, muted_until, reset_at, session_id))
-        conn.commit()
+        # SỬA TẠI ĐÂY: Thêm khối cursor giống hệt 2 hàm dưới để nói chuyện với SQL Server
+        with conn.cursor() as cursor:
+            try:
+                cursor.execute("""
+                    UPDATE gritalyst_session SET
+                        msg_count   = ?,
+                        nsfw_streak = ?,
+                        muted_until = ?,
+                        reset_at    = ?,
+                        updated_at  = GETDATE()
+                    WHERE session_id = ?
+                """, (msg_count, nsfw_streak, muted_until, reset_at, session_id))
+
+                # Xác nhận lưu trạng thái và nhả khóa database
+                conn.commit()
+                print(f"[SQL SERVER] Đã cập nhật trạng thái session {session_id} xuống DB!")
+            except Exception as e:
+                print(f"[SQL SERVER ERROR] Lỗi cập nhật trạng thái session: {e}")
+                conn.rollback()
 
 
 # ============================================================
@@ -264,25 +284,37 @@ def log_message(session_id: int, user_id: int = None,
                 msg_type: str = "normal",
                 nsfw_level: int = 0,
                 tokens_used: int = None):
-    """
-    Ghi 1 dòng log vào gritalyst_log sau mỗi tin nhắn.
-    Gọi sau khi Gritalyst đã trả lời xong.
-
-    msg_type: 'normal' | 'nsfw' | 'blocked'
-    nsfw_level: 0=sạch, 1-6=soft, 7-8=hard, 9=muted
-
-    [UPDATE v1] tokens_used để sau khi tích hợp Gemini API điền vào
-    """
+    # Dùng context manager bọc cả kết nối và cursor để tự động giải phóng bộ nhớ khi chạy xong
     with get_connection() as conn:
-        conn.execute("""
-            INSERT INTO gritalyst_log
-                (session_id, user_id, user_message, bot_response,
-                 msg_type, nsfw_level, tokens_used)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (session_id, user_id, user_message, bot_response,
-              msg_type, nsfw_level, tokens_used))
-        conn.commit()
+        with conn.cursor() as cursor:
+            # Lưu ý: Nếu dùng thư viện pymssql thì thay các dấu ? thành %s
+            cursor.execute("""
+                INSERT INTO gritalyst_log
+                    (session_id, user_id, user_message, bot_response,
+                     msg_type, nsfw_level, tokens_used)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (session_id, user_id, user_message, bot_response,
+                  msg_type, nsfw_level, tokens_used))
+            conn.commit()
 
+
+def reset_chat_history(session_id: int):
+    # Khối with thứ nhất: Đảm bảo conn luôn luôn được giải phóng và ĐÓNG hoàn toàn
+    with get_connection() as conn:
+        # Khối with thứ hai: Đảm bảo cursor được giải phóng ngay sau khi dùng xong
+        with conn.cursor() as cursor:
+            try:
+                # Thực thi lệnh xóa trên SQL Server
+                cursor.execute("DELETE FROM gritalyst_log WHERE session_id = ?", (session_id,))
+
+                # 🌟 BẮT BUỘC PHẢI CÓ DÒNG NÀY: Xác nhận lưu và nhả ổ khóa dữ liệu trên SSMS ngay lập tức!
+                conn.commit()
+                print(f"[SQL SERVER] Đã giải phóng hoàn toàn session {session_id} thành công!")
+
+            except Exception as e:
+                print(f"[SQL SERVER ERROR] Lỗi thực thi lệnh DELETE: {e}")
+                # Nếu lỗi thì hủy thao tác, không cho treo lệnh chờ
+                conn.rollback()
 
 # ============================================================
 # NHÓM HÀM: FOOD SCAN LOG

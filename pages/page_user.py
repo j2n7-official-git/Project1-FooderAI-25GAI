@@ -1,10 +1,69 @@
 import os
+import math
+import threading
+import webbrowser
+import http.server
+import urllib.parse
 from PySide6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QLabel,
                                QWidget, QGraphicsDropShadowEffect, QPushButton,
-                               QLineEdit, QSizePolicy, QButtonGroup)
-from PySide6.QtCore import Qt, QSize
+                               QLineEdit, QSizePolicy, QButtonGroup, QMessageBox)
+from PySide6.QtCore import Qt, QSize, Signal, QObject
 from PySide6.QtGui import (QFont, QColor, QPixmap, QPainter, QPainterPath,
                            QBrush, QPen, QLinearGradient, QIcon)
+from fooder_widgetBack import NutritionLogic
+
+# ─── Thư viện OAuth mới — chỉ cần requests ───────────────────────────────────
+try:
+    import requests as _requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
+
+# ─── DB layer ────────────────────────────────────────────────────────────────
+try:
+    from fooder_database import upsert_user, update_user_profile, get_user_by_uid
+    _DB_OK = True
+except Exception:
+    _DB_OK = False
+
+# ─── Config Google OAuth — đọc từ .env, không cần client_secrets.json ────────
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv()
+_GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
+_GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+_GAUTH_OK      = bool(_GOOGLE_CLIENT_ID and _GOOGLE_CLIENT_SECRET and _REQUESTS_OK)
+_REDIRECT_URI  = "http://localhost:8765/oauth2callback"
+_REDIRECT_PORT = 8765
+
+# ─── Signal bridge: OAuth chạy trong thread → Qt main thread ─────────────────
+class _OAuthSignals(QObject):
+    login_success = Signal(str, str, str, str)  # uid, email, display_name, photo_url
+    login_failed  = Signal(str)                 # error message
+
+
+# ─── Callback HTTP server bắt code từ Google ─────────────────────────────────
+class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    """Bắt request redirect từ Google, parse code, gọi exchange."""
+    auth_code: str = None
+    flow: object  = None
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        if "code" in params:
+            _OAuthCallbackHandler.auth_code = params["code"][0]
+        self.send_response(200)
+        self.end_headers()
+        html = (
+            "<html><body style='font-family:sans-serif;text-align:center;padding-top:80px'>"
+            "<h2 style='color:#3EE28C'>&#10003; &nbsp;Dang nhap thanh cong!</h2>"
+            "<p>Ban co the dong tab nay va quay lai FooderAI.</p>"
+            "</body></html>"
+        )
+        self.wfile.write(html.encode("utf-8"))
+
+    def log_message(self, fmt, *args):  # tắt log console
+        pass
 
 # =====================================================================
 # HẰNG SỐ MÀU — PALETTE TRANG HỒ SƠ
@@ -272,8 +331,20 @@ class GoalButton(QPushButton):
 # LỚP CHÍNH: PAGEUSERPROFILE
 # =====================================================================
 class PageUserProfile(QFrame):
+    # --- ĐỊNH NGHĨA 2 SIGNALS CHÍ HẠNG MẠNG ĐỂ CỨU LỖI ATTRIBUTEERROR ---
+    stats_saved = Signal(float, int, int, int)  # bmi, bmr, tdee, goal_kcal
+    username_changed = Signal(str)  # Truyền username mới lên dashboard
+
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        # ── State đăng nhập ────────────────────────────────────────────
+        self._user_id: int | None = None   # user_id nội bộ trong DB (sau khi login)
+        self._uid:     str | None = None   # Firebase/Google uid
+        self._oauth_signals = _OAuthSignals()
+        self._oauth_signals.login_success.connect(self._apply_login)
+        self._oauth_signals.login_failed.connect(self._on_login_error)
+        # ──────────────────────────────────────────────────────────────
         self.setFixedSize(1240, 640)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("""
@@ -897,19 +968,392 @@ class PageUserProfile(QFrame):
 
         parent_lay.addWidget(right, 1)
 
+    # ============================================================
+    # PATCH page_user.py — OAuth không cần client_secrets.json
+    # ============================================================
+    # [UPDATE v1.6] — 02/06/2026 — Tài · Tuấn · Vanh
+    #
+    # VẤN ĐỀ CŨ:
+    #   - Cần file client_secrets.json + thư viện google-auth-oauthlib
+    #   - Thiếu 1 trong 2 → fallback ngay, không hiện Google sign-in
+    #
+    # CHIẾN THUẬT MỚI:
+    #   - Build OAuth URL thủ công bằng requests thuần
+    #   - Chỉ cần GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET trong .env
+    #   - Mở full browser (Google chặn embedded webview từ 2019)
+    #   - Local HTTP server bắt redirect như cũ (đã hoạt động tốt)
+    #
+    # HƯỚNG DẪN:
+    #   1. Thêm vào file .env:
+    #        GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com
+    #        GOOGLE_CLIENT_SECRET=GOCSPX-xxx
+    #
+    #   2. Trong Google Cloud Console:
+    #        Credentials → OAuth Client ID → Desktop app
+    #        Authorized redirect URIs: http://localhost:8765/oauth2callback
+    #
+    #   3. Thay toàn bộ phần IMPORT OAuth (dòng 20-45) trong page_user.py
+    #      bằng block import bên dưới
+    #
+    #   4. Thay hàm _on_google_login bằng hàm mới bên dưới
+    # ============================================================
     def _on_google_login(self):
-        print("[INFO] Google OAuth chưa được tích hợp.")
+        """
+        Mở full browser → Google Consent → redirect về localhost:8765 →
+        exchange code → lấy userinfo → upsert DB → cập nhật UI.
+
+        [v1.6] Không cần client_secrets.json — dùng CLIENT_ID từ .env
+        Full browser bắt buộc: Google chặn embedded webview từ 2019.
+        """
+        from fooder_logger import flog
+
+        if not _GAUTH_OK:
+            missing = []
+            if not _GOOGLE_CLIENT_ID:     missing.append("GOOGLE_CLIENT_ID")
+            if not _GOOGLE_CLIENT_SECRET: missing.append("GOOGLE_CLIENT_SECRET")
+            if not _REQUESTS_OK:          missing.append("thư viện requests")
+            flog("AUTH", f"⚠️ Thiếu: {', '.join(missing)} → fallback", level="WARN")
+            self._fallback_manual_login()
+            return
+
+        self.btn_google.setEnabled(False)
+        self.btn_google.setText("  Đang mở trình duyệt…")
+        flog("AUTH", "🔄 Bắt đầu Google OAuth flow...")
+
+        def _run_oauth():
+            try:
+                import urllib.parse
+                import secrets
+
+                # ── Bước 1: Build OAuth URL thủ công ────────────────────────
+                state = secrets.token_urlsafe(16)  # chống CSRF
+                params = {
+                    "client_id": _GOOGLE_CLIENT_ID,
+                    "redirect_uri": _REDIRECT_URI,
+                    "response_type": "code",
+                    "scope": "openid email profile",
+                    "access_type": "offline",
+                    "prompt": "consent",
+                    "state": state,
+                }
+                auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + \
+                           urllib.parse.urlencode(params)
+
+                # ── Bước 2: Mở full browser ──────────────────────────────────
+                import webbrowser
+                webbrowser.open(auth_url)
+                flog("AUTH", f"🌐 Đã mở browser: {auth_url[:60]}...")
+
+                # ── Bước 3: Local server bắt redirect ───────────────────────
+                import http.server
+                _OAuthCallbackHandler.auth_code = None
+                server = http.server.HTTPServer(
+                    ("localhost", _REDIRECT_PORT), _OAuthCallbackHandler
+                )
+                server.timeout = 120
+                server.handle_request()
+
+                code = _OAuthCallbackHandler.auth_code
+                if not code:
+                    flog("AUTH", "❌ Không nhận được code từ Google", level="ERROR")
+                    self._oauth_signals.login_failed.emit(
+                        "Không nhận được mã xác thực từ Google.\n"
+                        "Kiểm tra lại trình duyệt hoặc thử lại."
+                    )
+                    return
+
+                flog("AUTH", "✅ Nhận được auth code — đang exchange token...")
+
+                # ── Bước 4: Exchange code → access token ────────────────────
+                token_resp = _requests.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "code": code,
+                        "client_id": _GOOGLE_CLIENT_ID,
+                        "client_secret": _GOOGLE_CLIENT_SECRET,
+                        "redirect_uri": _REDIRECT_URI,
+                        "grant_type": "authorization_code",
+                    },
+                    timeout=15,
+                )
+                token_data = token_resp.json()
+
+                if "error" in token_data:
+                    err = token_data.get("error_description", token_data["error"])
+                    flog("AUTH", f"❌ Token exchange lỗi: {err}", level="ERROR")
+                    self._oauth_signals.login_failed.emit(f"Lỗi token: {err}")
+                    return
+
+                access_token = token_data.get("access_token", "")
+                flog("AUTH", "✅ Exchange token thành công")
+
+                # ── Bước 5: Lấy thông tin user ──────────────────────────────
+                user_resp = _requests.get(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=10,
+                )
+                info = user_resp.json()
+
+                uid = info.get("id", "")
+                email = info.get("email", "")
+                name = info.get("name", email.split("@")[0])
+                photo_url = info.get("picture", "")
+
+                flog("AUTH", f"✅ Đăng nhập thành công: {name} ({email})")
+                self._oauth_signals.login_success.emit(uid, email, name, photo_url)
+
+            except Exception as e:
+                flog("AUTH", f"❌ OAuth lỗi: {e}", level="ERROR")
+                self._oauth_signals.login_failed.emit(str(e))
+
+        threading.Thread(target=_run_oauth, daemon=True).start()
+
+    def _fallback_manual_login(self):
+        """
+        Khi chưa cài OAuth lib → vẫn cho nhập tên tay để dùng Lưu hồ sơ.
+        uid giả = 'local_' + tên máy (không lưu DB nhưng UI vẫn hoạt động).
+        """
+        import socket
+        fake_uid   = f"local_{socket.gethostname()}"
+        fake_email = "local@fooderai.app"
+        fake_name  = "Người dùng cục bộ"
+        self._apply_login(fake_uid, fake_email, fake_name, "")
+
+    def _apply_login(self, uid: str, email: str, name: str, photo_url: str):
+        """
+        Chạy trên Qt main thread (emit từ signal).
+        Cập nhật UI + upsert DB.
+        """
+        import traceback
+        self._uid = uid
+
+        # Cập nhật hiển thị lên giao diện UI trước
+        self.input_name.setText(name)
+        if hasattr(self, 'username_changed'):
+            self.username_changed.emit(name)
+
+        # ── Upsert DB ──────────────────────────────────────────────
+        if _DB_OK:
+            try:
+                print(f"[DB] Đang đồng bộ tài khoản: {name} vào SQL Server...")
+
+                # SỬA TẠI ĐÂY: Hứng cái kết quả SỐ NGUYÊN từ hàm upsert_user trả về
+                self._user_id = upsert_user(uid, name, email, photo_url, None)
+
+                # Tải lại dữ liệu cũ nếu đã có hồ sơ trong DB
+                if self._user_id is not None:
+                    self._load_saved_profile()
+                    print("[DB] Đồng bộ và tải profile thành công!")
+                else:
+                    print("❌ [DB] Lỗi không lấy được user_id số nguyên từ DB.")
+
+            except Exception as e:
+                print("\n" + "!" * 40)
+                print("❌❌❌ PHÁT HIỆN LỖI CHÍ MẠNG TẠI HÀM _apply_login:")
+                traceback.print_exc()
+                print("!" * 40 + "\n")
+
+
+
+        # ── Cập nhật UI cột trái ───────────────────────────────────
+        self.lbl_name.setText(name)
+        self.lbl_email.setText(email)
+        self.btn_google.setVisible(False)
+        self.btn_logout.setVisible(True)
+
+        # Avatar từ URL (download async)
+        if photo_url:
+            threading.Thread(
+                target=self._load_avatar_url,
+                args=(photo_url,),
+                daemon=True,
+            ).start()
+
+        # Mở khóa ô tên
+        self.input_name.setEnabled(True)
+        self.input_name.setText(name)
+        self.input_name.setStyleSheet("""
+            QLineEdit {
+                background-color: white; color: #1A2A3A;
+                border-radius: 22px; border: 1.5px solid rgba(0,77,77,0.25);
+                padding: 0 18px;
+            }
+            QLineEdit:focus { border: 1.5px solid #3EE28C; }
+        """)
+
+    def _load_saved_profile(self):
+        """Tải lại hồ sơ đã lưu từ DB để điền sẵn vào form."""
+        if not _DB_OK or not self._uid:
+            return
+        try:
+            row = get_user_by_uid(self._uid)
+            if not row:
+                return
+            # Điền form từ DB (bỏ qua None)
+            if row.get("age"):
+                self.input_age.setText(str(row["age"]))
+            if row.get("height_cm"):
+                self.input_height.setText(str(int(row["height_cm"])))
+            if row.get("weight_kg"):
+                self.input_weight.setText(str(int(row["weight_kg"])))
+            # Giới tính
+            if row.get("gender") == "female":
+                self.btn_female.setChecked(True)
+                self.btn_female.click()
+            # Mục tiêu
+            goal_map = {"lose": self.btn_lose, "maintain": self.btn_maintain, "gain": self.btn_gain}
+            if row.get("goal") in goal_map:
+                goal_map[row["goal"]].click()
+        except Exception as e:
+            print(f"[DB] load profile lỗi: {e}")
+
+    def _load_avatar_url(self, url: str):
+        """Download ảnh avatar từ URL và cập nhật widget (chạy trong thread)."""
+        try:
+            import urllib.request
+            from io import BytesIO
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                data = resp.read()
+            pix = QPixmap()
+            pix.loadFromData(data)
+            if not pix.isNull():
+                self.avatar.set_pixmap(pix)
+        except Exception:
+            pass
+
+    def _on_login_error(self, msg: str):
+        self.btn_google.setEnabled(True)
+        self.btn_google.setText("  Đăng nhập với Google")
+        QMessageBox.warning(self, "Đăng nhập thất bại", f"Lỗi OAuth:\n{msg}")
 
     def _on_logout(self):
+        self._user_id = None
+        self._uid     = None
         self.avatar.reset_default()
         self.lbl_name.setText("Chưa đăng nhập")
         self.lbl_email.setText("–")
         self.btn_google.setVisible(True)
+        self.btn_google.setEnabled(True)
+        self.btn_google.setText("  Đăng nhập với Google")
         self.btn_logout.setVisible(False)
+        # Khóa lại ô tên
+        self.input_name.setEnabled(False)
+        self.input_name.clear()
+        self.input_name.setStyleSheet("""
+            QLineEdit {
+                background-color: #F0F4F8; color: #8A9BAC;
+                border-radius: 22px; border: 1.5px solid #C8D0D8;
+                padding: 0 18px;
+            }
+        """)
+        # Ẩn panel kết quả nếu đang hiển thị
+        if hasattr(self, "_result_panel") and self._result_panel:
+            self._result_panel.setVisible(False)
 
+    # ================================================================
+    # LƯU HỒ SƠ — tính BMI / BMR / TDEE → lưu DB → hiển thị kết quả
+    # ================================================================
     def _on_save(self):
-        # Đọc giá trị form — sau này kết nối DB/Firebase tại đây
-        print("[SAVE] Họ tên:", self.input_name.text())
-        print("[SAVE] Tuổi:", self.input_age.text())
-        print("[SAVE] Chiều cao:", self.input_height.text())
-        print("[SAVE] Cân nặng:", self.input_weight.text())
+        # ── 1. Validate dữ liệu đầu vào (Giữ nguyên) ──────────────────────────────
+        errors = []
+        try:
+            age = int(self.input_age.text())
+            assert 5 <= age <= 120
+        except Exception:
+            errors.append("• Tuổi không hợp lệ (5 – 120).")
+
+        try:
+            height = float(self.input_height.text())
+            assert 50 <= height <= 250
+        except Exception:
+            errors.append("• Chiều cao không hợp lệ (50 – 250 cm).")
+
+        try:
+            weight = float(self.input_weight.text())
+            assert 10 <= weight <= 400
+        except Exception:
+            errors.append("• Cân nặng không hợp lệ (10 – 400 kg).")
+
+        if errors:
+            QMessageBox.warning(self, "Thiếu thông tin",
+                                "Vui lòng sửa lại:\n" + "\n".join(errors))
+            return
+
+        # ── 2. Đọc giới tính & mục tiêu ───────────────────────────────
+        gender = "female" if self.btn_female.isChecked() else "male"
+        if self.btn_maintain.isChecked():
+            goal = "maintain"
+        elif self.btn_gain.isChecked():
+            goal = "gain"
+        else:
+            goal = "lose"
+
+        # ── 3. Đọc hệ số vận động ─────────────────────────────────────
+        act_idx = next((i for i, (btn, _, __) in enumerate(self._act_buttons)
+                        if btn.isChecked()), 0)
+        act_factor = self._activity_factors.get(act_idx, 1.2)
+
+        # =========================================================================
+        # 4. TRUYỀN DỮ LIỆU QUA PHÂN XƯỞNG LOGIC (BACK-END) ĐỂ TÍNH TOÁN
+        # =========================================================================
+        bmi = NutritionLogic.calculate_bmi(weight, height)
+        bmr = NutritionLogic.calculate_bmr(weight, height, age, gender)
+        tdee = NutritionLogic.calculate_tdee(bmr, act_factor)
+
+        goal_kcal, _ = self._calc_goal_kcal(tdee, goal)
+
+        # ── 5. Lưu DB ─────────────────────────────────────────────────
+        if _DB_OK and self._user_id:
+            try:
+                update_user_profile(
+                    user_id=self._user_id,
+                    age=age,
+                    gender=gender,
+                    height_cm=height,
+                    weight_kg=weight,
+                    goal=goal,
+                    activity_level=act_factor,
+                    bmi=round(bmi, 2),
+                    bmr=int(bmr),
+                    tdee=int(tdee),
+                )
+                print(f"[DB] update_user_profile OK — BMI={bmi:.1f} BMR={int(bmr)} TDEE={int(tdee)}")
+            except Exception as e:
+                print(f"[DB] update_user_profile lỗi: {e}")
+
+        # =========================================================================
+        # 6. PHÁT TÍN HIỆU ĐỂ CẬP NHẬT 4 Ô WIDGET & TIÊU ĐỀ TRÊN DASHBOARD
+        # =========================================================================
+        self.stats_saved.emit(float(bmi), int(bmr), int(tdee), int(goal_kcal))
+
+        user_name = self.input_name.text().strip()
+        if not user_name:
+            user_name = "Người dùng"
+        self.username_changed.emit(user_name)
+
+        # ── 7. ẨN BẢNG KẾT QUẢ CŨ NẾU CÓ ───────────────────────────
+        if hasattr(self, "_result_panel") and self._result_panel is not None:
+            self._result_panel.setVisible(False)
+
+    @staticmethod
+    def _classify_bmi(bmi: float) -> tuple[str, str]:
+        """Phân loại BMI theo WHO, trả về (nhãn, màu hex)."""
+        if bmi < 18.5:
+            return "⚠ Thiếu cân", "#FF9800"
+        elif bmi < 25.0:
+            return "✓ Bình thường", "#3EE28C"
+        elif bmi < 30.0:
+            return "⚠ Thừa cân", "#FF9800"
+        else:
+            return "⚠ Béo phì", "#F44336"
+
+    @staticmethod
+    def _calc_goal_kcal(tdee: int, goal: str) -> tuple[int, str]:
+        """Tính calo mục tiêu dựa trên TDEE và goal."""
+        if goal == "lose":
+            return int(tdee - 500), "Giảm 0.5 kg/tuần"
+        elif goal == "gain":
+            return int(tdee + 500), "Tăng 0.5 kg/tuần"
+        else:
+            return tdee, "Duy trì cân nặng"
